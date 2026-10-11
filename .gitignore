@@ -1,0 +1,9 @@
+# secrets
+.env
+
+# build output
+build/
+out/
+
+# scratch
+_*
