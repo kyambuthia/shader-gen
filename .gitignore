@@ -7,3 +7,6 @@ out/
 
 # scratch
 _*
+
+# rust
+/target
