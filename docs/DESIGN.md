@@ -112,3 +112,48 @@ baking a mesh plus skeleton. Lower risk, integrates with any engine or physics
 library, and still gives procedural generation - but it puts the mesh and the
 collider back into separate artifacts, which is the problem the SDF was chosen
 to solve. Kept as the fallback if the runtime cost proves unworkable.
+
+## Status
+
+All six phases are implemented. What each one actually turned into:
+
+1. **Render** - sphere tracer with soft shadows and AO. The ground plane is
+   intersected analytically rather than marched; tracing an infinite plane
+   converges slowly at grazing angles and the distance-scaled hit epsilon then
+   terminates rays at banded depths, which reads as concentric rings.
+2. **Parity** - `tests/parity.rs`, run over five seeds, tolerance 1e-3 m. The
+   GPU half is a *fragment* shader writing to a 512x1 target, not a compute
+   pass: downlevel GL adapters report zero compute workgroups and refuse one.
+   It encodes each f32 as its raw bit pattern through `Rgba8Unorm`, because
+   `Rgba32Float` is not renderable everywhere either, and a unorm8 byte
+   round-trips exactly so nothing is lost.
+3. **Collision** - capsule fitted to the character's own resolved bounds,
+   pushed out of the world along the gradient, four solver passes. Plus
+   step-up: a capsule cannot climb anything taller than its radius, so a
+   blocked grounded move is retried from a lifted start and dropped back onto
+   whatever is underneath. Without it the character stops dead at a 0.3 m kerb.
+4. **Animation** - the skeleton is authored as head/tail pairs in model space
+   and converted to parent-relative rotations at construction, because nobody
+   can reason about a chain of local quaternions. Posing resolves to a flat
+   list of world-space cones, so the shader never learns what a bone is.
+   Stride advances with distance travelled, not time, so the gait stays locked
+   to the ground at any speed.
+5. **Generation** - a seed picks height, bulk, leg ratio, shoulder width, head
+   and arm scale; every radius and joint derives from those. Proved out last,
+   as planned.
+6. **Optimisation** - the character march is clipped to its bounding box by a
+   slab test, so a ray that misses the body costs one test instead of ~96
+   field evaluations.
+
+### Not done
+
+- **No bounding proxy geometry.** Phase 6 clips the *march*, but the fragment
+  shader still runs over the whole screen. Rasterising an actual box so only
+  covering fragments are shaded is the larger remaining win.
+- **No half-resolution pass or upscale.**
+- **Never profiled.** The costs in this document are arithmetic, not
+  measurements. The only adapter this has run on is a downlevel GL one with no
+  compute support, which is also why several format choices above are more
+  conservative than they would otherwise need to be.
+- **The windowed path is written but unverified** - everything here was
+  checked through `--headless` and the test suite.

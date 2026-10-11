@@ -1,21 +1,21 @@
-//! The character definition and its CPU evaluator.
+//! The character: a bone hierarchy, its resolved cones, and the CPU evaluator.
 //!
-//! This module is the single source of truth for the character's shape. The
-//! same `Cone` list is uploaded to the GPU and sphere-traced by
-//! `shaders/character.wgsl`; the evaluator here is what collision will query.
-//! The two implementations must agree, which is what `tests/parity.rs` exists
-//! to enforce - see `docs/DESIGN.md`.
+//! This module is the single source of truth for the character's shape. Posing
+//! happens here, on the CPU, and resolves the skeleton into a flat list of
+//! world-space cones. That list is what the GPU receives and what collision
+//! queries, so the shader never needs to know about bones and the two sides
+//! cannot disagree about where the surface is. `tests/parity.rs` enforces it.
 
 use bytemuck::{Pod, Zeroable};
-use glam::Vec3;
+use glam::{Quat, Vec3};
 
-/// A round cone: a segment from `a` to `b` with a radius at each end. Exact
-/// distance function, tapers like a limb, and cheap to evaluate.
+/// A round cone: a segment with a radius at each end. Exact distance function,
+/// tapers like a limb, cheap to evaluate.
 ///
 /// Packed as two `vec4`s so the GPU layout needs no padding: `xyz` is the
-/// endpoint and `w` is that end's radius.
+/// endpoint, `w` is that end's radius.
 #[repr(C)]
-#[derive(Clone, Copy, Debug, Pod, Zeroable)]
+#[derive(Clone, Copy, Debug, Default, Pod, Zeroable)]
 pub struct Cone {
     pub a: [f32; 4],
     pub b: [f32; 4],
@@ -28,30 +28,148 @@ impl Cone {
             b: [b.x, b.y, b.z, r_b],
         }
     }
-
     pub fn head(&self) -> Vec3 {
         Vec3::new(self.a[0], self.a[1], self.a[2])
     }
-
     pub fn tail(&self) -> Vec3 {
         Vec3::new(self.b[0], self.b[1], self.b[2])
     }
 }
 
-/// Upper bound on cones, so the GPU buffer can be a fixed allocation.
+/// Upper bound on cones, so the GPU buffer is a fixed allocation.
 pub const MAX_CONES: usize = 64;
 
-pub struct CharacterDef {
-    pub cones: Vec<Cone>,
-    /// Smooth-minimum radius. Larger fuses joints more and costs more
-    /// raymarch steps, because `smin` degrades the distance bound.
+/// How a bone is authored: head and tail in model space, which is far easier
+/// to reason about than a chain of local rotations. `Skeleton::new` converts
+/// to the parent-relative form the pose maths needs.
+pub struct BoneSpec {
+    pub parent: i32,
+    pub head: Vec3,
+    pub tail: Vec3,
+    pub r_head: f32,
+    pub r_tail: f32,
+}
+
+pub struct Bone {
+    pub parent: i32,
+    /// Offset from the parent's head, in the parent's rest frame.
+    pub offset: Vec3,
+    /// Rest rotation relative to the parent's rest frame.
+    pub rest: Quat,
+    pub length: f32,
+    pub r_head: f32,
+    pub r_tail: f32,
+}
+
+pub struct Skeleton {
+    pub bones: Vec<Bone>,
+    /// Smooth-minimum radius. Larger fuses joints more and costs more raymarch
+    /// steps, because `smin` degrades the distance bound.
     pub blend_k: f32,
 }
 
-/// Exact distance to a round cone. Adapted from the standard derivation:
-/// the segment is split into the two spherical caps and the conical band
-/// between them, and the nearest of the three is returned.
-fn sd_round_cone(p: Vec3, a: Vec3, b: Vec3, r1: f32, r2: f32) -> f32 {
+/// Bone indices into the humanoid skeleton, for the walk cycle to drive.
+pub mod joint {
+    pub const PELVIS: usize = 0;
+    pub const SPINE: usize = 1;
+    pub const CHEST: usize = 2;
+    pub const NECK: usize = 3;
+    pub const HEAD: usize = 4;
+    pub const UPPER_ARM_L: usize = 6;
+    pub const FOREARM_L: usize = 7;
+    pub const UPPER_ARM_R: usize = 10;
+    pub const FOREARM_R: usize = 11;
+    pub const THIGH_L: usize = 13;
+    pub const SHIN_L: usize = 14;
+    pub const FOOT_L: usize = 15;
+    pub const THIGH_R: usize = 16;
+    pub const SHIN_R: usize = 17;
+    pub const FOOT_R: usize = 18;
+}
+
+/// Per-bone animation rotation, applied on top of the rest pose.
+#[derive(Clone)]
+pub struct Pose {
+    pub root: Vec3,
+    pub yaw: f32,
+    pub local: Vec<Quat>,
+}
+
+impl Pose {
+    pub fn rest(skeleton: &Skeleton) -> Self {
+        Self {
+            root: Vec3::ZERO,
+            yaw: 0.0,
+            local: vec![Quat::IDENTITY; skeleton.bones.len()],
+        }
+    }
+}
+
+fn rotation_to(dir: Vec3) -> Quat {
+    Quat::from_rotation_arc(Vec3::Y, dir.normalize_or_zero())
+}
+
+impl Skeleton {
+    pub fn new(specs: &[BoneSpec], blend_k: f32) -> Self {
+        // Rest orientation of each bone in model space, then converted to the
+        // parent-relative pair (offset, rest) that posing composes.
+        let mut world_rest: Vec<Quat> = Vec::with_capacity(specs.len());
+        let mut bones = Vec::with_capacity(specs.len());
+
+        for spec in specs {
+            let axis = spec.tail - spec.head;
+            let rotation = rotation_to(axis);
+            let (offset, rest) = if spec.parent < 0 {
+                (spec.head, rotation)
+            } else {
+                let parent = &specs[spec.parent as usize];
+                let inverse = world_rest[spec.parent as usize].inverse();
+                (inverse * (spec.head - parent.head), inverse * rotation)
+            };
+            world_rest.push(rotation);
+            bones.push(Bone {
+                parent: spec.parent,
+                offset,
+                rest,
+                length: axis.length(),
+                r_head: spec.r_head,
+                r_tail: spec.r_tail,
+            });
+        }
+
+        assert!(bones.len() <= MAX_CONES, "skeleton exceeds MAX_CONES");
+        Self { bones, blend_k }
+    }
+
+    /// Walk the hierarchy and write one world-space cone per bone.
+    pub fn resolve(&self, pose: &Pose, out: &mut Vec<Cone>) {
+        out.clear();
+        let yaw = Quat::from_rotation_y(pose.yaw);
+        let mut heads: Vec<Vec3> = Vec::with_capacity(self.bones.len());
+        let mut rotations: Vec<Quat> = Vec::with_capacity(self.bones.len());
+
+        for (index, bone) in self.bones.iter().enumerate() {
+            let (parent_head, parent_rotation) = if bone.parent < 0 {
+                (pose.root, yaw)
+            } else {
+                let p = bone.parent as usize;
+                (heads[p], rotations[p])
+            };
+
+            let head = parent_head + parent_rotation * bone.offset;
+            let rotation = parent_rotation * bone.rest * pose.local[index];
+            let tail = head + rotation * (Vec3::Y * bone.length);
+
+            heads.push(head);
+            rotations.push(rotation);
+            out.push(Cone::new(head, bone.r_head, tail, bone.r_tail));
+        }
+    }
+}
+
+/// Exact distance to a round cone. The segment splits into two spherical caps
+/// and the conical band between them; the nearest of the three wins.
+pub fn sd_round_cone(p: Vec3, a: Vec3, b: Vec3, r1: f32, r2: f32) -> f32 {
     let ba = b - a;
     let l2 = ba.dot(ba);
     let rr = r1 - r2;
@@ -75,98 +193,47 @@ fn sd_round_cone(p: Vec3, a: Vec3, b: Vec3, r1: f32, r2: f32) -> f32 {
     ((x2 * a2 * il2).sqrt() + y * rr) * il2 - r1
 }
 
-/// Polynomial smooth minimum. Fuses joints instead of leaving a crease, at
-/// the cost of the field no longer being a true distance.
-fn smin(a: f32, b: f32, k: f32) -> f32 {
+/// Polynomial smooth minimum. Fuses joints instead of leaving a crease, at the
+/// cost of the field no longer being a true distance.
+pub fn smin(a: f32, b: f32, k: f32) -> f32 {
     let h = (0.5 + 0.5 * (b - a) / k).clamp(0.0, 1.0);
     (b * (1.0 - h) + a * h) - k * h * (1.0 - h)
 }
 
-impl CharacterDef {
-    /// Signed distance to the character. Negative inside.
-    ///
-    /// Must stay numerically identical to `sd_character` in
-    /// `shaders/character.wgsl`.
-    pub fn distance(&self, p: Vec3) -> f32 {
-        let mut d = f32::MAX;
-        for cone in &self.cones {
-            let c = sd_round_cone(p, cone.head(), cone.tail(), cone.a[3], cone.b[3]);
-            d = if d == f32::MAX {
-                c
-            } else {
-                smin(d, c, self.blend_k)
-            };
-        }
-        d
+/// Signed distance to a resolved cone list. Negative inside.
+///
+/// Must stay numerically identical to `sd_character` in
+/// `shaders/common.wgsl`, which `tests/parity.rs` checks.
+pub fn distance(cones: &[Cone], blend_k: f32, p: Vec3) -> f32 {
+    let mut d = 0.0;
+    for (index, cone) in cones.iter().enumerate() {
+        let c = sd_round_cone(p, cone.head(), cone.tail(), cone.a[3], cone.b[3]);
+        d = if index == 0 { c } else { smin(d, c, blend_k) };
     }
-
-    /// Surface normal by central differences on the field.
-    pub fn normal(&self, p: Vec3) -> Vec3 {
-        const E: f32 = 1.0e-3;
-        Vec3::new(
-            self.distance(p + Vec3::X * E) - self.distance(p - Vec3::X * E),
-            self.distance(p + Vec3::Y * E) - self.distance(p - Vec3::Y * E),
-            self.distance(p + Vec3::Z * E) - self.distance(p - Vec3::Z * E),
-        )
-        .normalize_or_zero()
-    }
-
-    /// Axis-aligned bounds, inflated by the blend radius since `smin` pushes
-    /// the surface outward where limbs meet.
-    pub fn bounds(&self) -> (Vec3, Vec3) {
-        let mut lo = Vec3::splat(f32::MAX);
-        let mut hi = Vec3::splat(f32::MIN);
-        for cone in &self.cones {
-            for (end, r) in [(cone.head(), cone.a[3]), (cone.tail(), cone.b[3])] {
-                lo = lo.min(end - Vec3::splat(r));
-                hi = hi.max(end + Vec3::splat(r));
-            }
-        }
-        let pad = Vec3::splat(self.blend_k);
-        (lo - pad, hi + pad)
-    }
+    d
 }
 
-/// A 1.8 m humanoid standing at the origin, feet on y = 0, facing +Z.
-///
-/// Step 1 holds the pose as fixed world-space segments. The parent/offset
-/// hierarchy from the design arrives with animation in step 4; posing a flat
-/// list is exactly the thing that does not work, so the structure changes
-/// rather than being bolted onto this.
-pub fn humanoid() -> CharacterDef {
-    let mut cones = vec![
-        // spine, pelvis to crown
-        Cone::new(Vec3::new(0.0, 0.88, 0.0), 0.145, Vec3::new(0.0, 0.98, 0.0), 0.135),
-        Cone::new(Vec3::new(0.0, 0.95, 0.0), 0.130, Vec3::new(0.0, 1.10, 0.0), 0.150),
-        Cone::new(Vec3::new(0.0, 1.10, 0.0), 0.165, Vec3::new(0.0, 1.45, 0.0), 0.145),
-        Cone::new(Vec3::new(0.0, 1.45, 0.0), 0.055, Vec3::new(0.0, 1.58, 0.0), 0.060),
-        Cone::new(Vec3::new(0.0, 1.58, 0.0), 0.105, Vec3::new(0.0, 1.74, 0.0), 0.095),
-    ];
+pub fn normal(cones: &[Cone], blend_k: f32, p: Vec3) -> Vec3 {
+    const E: f32 = 1.0e-3;
+    Vec3::new(
+        distance(cones, blend_k, p + Vec3::X * E) - distance(cones, blend_k, p - Vec3::X * E),
+        distance(cones, blend_k, p + Vec3::Y * E) - distance(cones, blend_k, p - Vec3::Y * E),
+        distance(cones, blend_k, p + Vec3::Z * E) - distance(cones, blend_k, p - Vec3::Z * E),
+    )
+    .normalize_or_zero()
+}
 
-    // Limbs, built on the +x side and mirrored.
-    let half: Vec<Cone> = vec![
-        // The arm hangs clear of the chest: at r = 0.165 the torso surface
-        // reaches x = 0.165, so an upper arm any further inboard than this is
-        // swallowed by it once `blend_k` is applied.
-        Cone::new(Vec3::new(0.02, 1.43, 0.0), 0.085, Vec3::new(0.21, 1.40, 0.0), 0.068),
-        Cone::new(Vec3::new(0.21, 1.40, 0.0), 0.068, Vec3::new(0.26, 1.12, 0.0), 0.052),
-        Cone::new(Vec3::new(0.26, 1.12, 0.0), 0.052, Vec3::new(0.29, 0.86, 0.0), 0.040),
-        Cone::new(Vec3::new(0.29, 0.86, 0.0), 0.043, Vec3::new(0.30, 0.76, 0.0), 0.033),
-        Cone::new(Vec3::new(0.09, 0.90, 0.0), 0.100, Vec3::new(0.10, 0.50, 0.0), 0.075),
-        Cone::new(Vec3::new(0.10, 0.50, 0.0), 0.072, Vec3::new(0.10, 0.08, 0.0), 0.050),
-        Cone::new(Vec3::new(0.10, 0.05, -0.02), 0.055, Vec3::new(0.10, 0.04, 0.14), 0.045),
-    ];
-    for cone in &half {
-        cones.push(*cone);
-        let (mut a, mut b) = (cone.a, cone.b);
-        a[0] = -a[0];
-        b[0] = -b[0];
-        cones.push(Cone { a, b });
+/// Axis-aligned bounds of a resolved cone list, inflated by the blend radius
+/// since `smin` pushes the surface outward where limbs meet.
+pub fn bounds(cones: &[Cone], blend_k: f32) -> (Vec3, Vec3) {
+    let mut lo = Vec3::splat(f32::MAX);
+    let mut hi = Vec3::splat(f32::MIN);
+    for cone in cones {
+        for (end, r) in [(cone.head(), cone.a[3]), (cone.tail(), cone.b[3])] {
+            lo = lo.min(end - Vec3::splat(r));
+            hi = hi.max(end + Vec3::splat(r));
+        }
     }
-
-    assert!(cones.len() <= MAX_CONES, "character exceeds MAX_CONES");
-    CharacterDef {
-        cones,
-        blend_k: 0.035,
-    }
+    let pad = Vec3::splat(blend_k);
+    (lo - pad, hi + pad)
 }
