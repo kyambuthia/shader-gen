@@ -145,15 +145,41 @@ All six phases are implemented. What each one actually turned into:
    slab test, so a ray that misses the body costs one test instead of ~96
    field evaluations.
 
-### Not done
 
-- **No bounding proxy geometry.** Phase 6 clips the *march*, but the fragment
-  shader still runs over the whole screen. Rasterising an actual box so only
-  covering fragments are shaded is the larger remaining win.
-- **No half-resolution pass or upscale.**
-- **Never profiled.** The costs in this document are arithmetic, not
-  measurements. The only adapter this has run on is a downlevel GL one with no
-  compute support, which is also why several format choices above are more
-  conservative than they would otherwise need to be.
-- **The windowed path is written but unverified** - everything here was
-  checked through `--headless` and the test suite.
+## Measured
+
+`--bench` on the only machine this has run on, a Mesa Intel HD Graphics 3000
+(Sandy Bridge, 2011, GL backend, no compute):
+
+| resolution | before | after |
+| --- | --- | --- |
+| 512x320 | - | 33.8 ms (29.6 fps) |
+| 640x400 | 125.2 ms (8.0 fps) | 49.1 ms (20.4 fps) |
+| 1024x640 | timed out | 115.7 ms (8.6 fps) |
+
+The window renders at `--scale` (default 2), so a 1024x640 window costs the
+512x320 figure. 2.5x came from three changes, in order of value:
+
+1. **Shadow rays stopped evaluating the body everywhere.** Nineteen cones at
+   every step of every shadow ray was the largest cost in the frame; most
+   ground pixels cast a ray that never passes near the character and were
+   paying for it anyway. Now the body is only sampled over the stretch of ray
+   that crosses its bounding box.
+2. **The box march is clipped to the boxes' collective bounds,** and the
+   ground plane was taken out of the marched field entirely - it is
+   intersected analytically and cannot shadow anything above itself. A ray
+   aimed at the sky now costs one slab test instead of a full step budget.
+3. **Half-resolution rendering with a bilinear upscale.** Everything else
+   trims work per ray; this removes three quarters of the rays.
+
+Occlusion got the same bounding-box treatment as shadows.
+
+### Still not done
+
+- **No proxy geometry.** The fragment shader still runs over the whole
+  screen. With the march clipped, a missing ray is cheap, so this is worth
+  much less than it looked before measuring - which is the point of measuring.
+- **Only ever run on one GPU,** and an unusually weak one. The format and
+  limit choices throughout are shaped by its downlevel GL backend.
+- **The windowed path is written but has never been executed.** Everything
+  here was verified through `--headless`, `--bench` and the test suite.

@@ -23,6 +23,8 @@ pub struct Globals {
     pub look_at: [f32; 4],
     pub bounds_lo: [f32; 4],
     pub bounds_hi: [f32; 4],
+    pub world_lo: [f32; 4],
+    pub world_hi: [f32; 4],
 }
 
 const COMMON: &str = include_str!("../shaders/common.wgsl");
@@ -338,5 +340,116 @@ impl ParityProbe {
         drop(data);
         self.readback.unmap();
         out
+    }
+}
+
+const BLIT: &str = include_str!("../shaders/blit.wgsl");
+
+/// Renders the scene to a reduced-size target and stretches it to the
+/// swapchain. On weak hardware this is the only optimisation left with real
+/// headroom: everything else trims work per ray, this removes three quarters
+/// of the rays.
+pub struct Upscale {
+    pipeline: wgpu::RenderPipeline,
+    layout: wgpu::BindGroupLayout,
+    sampler: wgpu::Sampler,
+    texture: Option<(wgpu::Texture, wgpu::TextureView, wgpu::BindGroup, u32, u32)>,
+    format: wgpu::TextureFormat,
+    pub scale: u32,
+}
+
+impl Upscale {
+    pub fn new(device: &wgpu::Device, output: wgpu::TextureFormat, scale: u32) -> Self {
+        let format = wgpu::TextureFormat::Rgba8Unorm;
+        let layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("blit"),
+            entries: &[
+                wgpu::BindGroupLayoutEntry {
+                    binding: 0,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        multisampled: false,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 1,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                    count: None,
+                },
+            ],
+        });
+        let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
+            label: Some("blit"),
+            mag_filter: wgpu::FilterMode::Linear,
+            min_filter: wgpu::FilterMode::Linear,
+            ..Default::default()
+        });
+        let pipeline = build_pipeline(device, &layout, BLIT, output);
+        Self { pipeline, layout, sampler, texture: None, format, scale: scale.max(1) }
+    }
+
+    /// The view the scene should be drawn into this frame.
+    pub fn target(&mut self, device: &wgpu::Device, width: u32, height: u32) -> &wgpu::TextureView {
+        let w = (width / self.scale).max(1);
+        let h = (height / self.scale).max(1);
+        let stale = !matches!(&self.texture, Some((_, _, _, tw, th)) if *tw == w && *th == h);
+        if stale {
+            let texture = device.create_texture(&wgpu::TextureDescriptor {
+                label: Some("scene target"),
+                size: wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 },
+                mip_level_count: 1,
+                sample_count: 1,
+                dimension: wgpu::TextureDimension::D2,
+                format: self.format,
+                usage: wgpu::TextureUsages::RENDER_ATTACHMENT
+                    | wgpu::TextureUsages::TEXTURE_BINDING,
+                view_formats: &[],
+            });
+            let view = texture.create_view(&Default::default());
+            let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("blit"),
+                layout: &self.layout,
+                entries: &[
+                    wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(&view) },
+                    wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::Sampler(&self.sampler) },
+                ],
+            });
+            self.texture = Some((texture, view, bind_group, w, h));
+        }
+        &self.texture.as_ref().unwrap().1
+    }
+
+    /// Size the scene is actually rendered at, for the resolution uniform.
+    pub fn render_size(&self, width: u32, height: u32) -> (u32, u32) {
+        ((width / self.scale).max(1), (height / self.scale).max(1))
+    }
+
+    pub fn present(&self, encoder: &mut wgpu::CommandEncoder, view: &wgpu::TextureView) {
+        let Some((_, _, bind_group, _, _)) = &self.texture else {
+            return;
+        };
+        let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+            label: Some("blit"),
+            color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                view,
+                depth_slice: None,
+                resolve_target: None,
+                ops: wgpu::Operations {
+                    load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
+                    store: wgpu::StoreOp::Store,
+                },
+            })],
+            depth_stencil_attachment: None,
+            timestamp_writes: None,
+            occlusion_query_set: None,
+            multiview_mask: None,
+        });
+        pass.set_pipeline(&self.pipeline);
+        pass.set_bind_group(0, bind_group, &[]);
+        pass.draw(0..3, 0..1);
     }
 }

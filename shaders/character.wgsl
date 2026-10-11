@@ -18,8 +18,8 @@ fn normal_at(p: vec3<f32>) -> vec3<f32> {
 fn world_normal_at(p: vec3<f32>) -> vec3<f32> {
     let e = vec2<f32>(1.0, -1.0) * 0.5773 * 0.0015;
     return normalize(
-        e.xyy * sd_world(p + e.xyy) + e.yyx * sd_world(p + e.yyx) +
-        e.yxy * sd_world(p + e.yxy) + e.xxx * sd_world(p + e.xxx));
+        e.xyy * sd_boxes(p + e.xyy) + e.yyx * sd_boxes(p + e.yyx) +
+        e.yxy * sd_boxes(p + e.yxy) + e.xxx * sd_boxes(p + e.xxx));
 }
 
 struct Hit {
@@ -50,15 +50,23 @@ fn march_character(origin: vec3<f32>, dir: vec3<f32>) -> Hit {
     return Hit(t, false);
 }
 
-fn march_world(origin: vec3<f32>, dir: vec3<f32>, limit: f32) -> Hit {
-    var t = 0.02;
-    for (var i = 0; i < 128; i = i + 1) {
-        let d = sd_world(origin + dir * t);
+// Clipped to the boxes' collective bounds, so a ray aimed at the sky or at
+// empty ground costs one slab test rather than a full step budget. This was
+// the largest single cost in the frame: every pixel paid for it.
+fn march_boxes(origin: vec3<f32>, dir: vec3<f32>, limit: f32) -> Hit {
+    let span = ray_world_bounds(origin, 1.0 / dir);
+    let stop = min(limit, span.y);
+    if (span.y < span.x || span.x > limit) {
+        return Hit(0.0, false);
+    }
+    var t = max(span.x, 0.02);
+    for (var i = 0; i < 72; i = i + 1) {
+        let d = sd_boxes(origin + dir * t);
         if (d < 0.0015 * t + 0.0008) {
             return Hit(t, true);
         }
         t = t + d * 0.95;
-        if (t > limit) {
+        if (t > stop) {
             break;
         }
     }
@@ -66,16 +74,27 @@ fn march_world(origin: vec3<f32>, dir: vec3<f32>, limit: f32) -> Hit {
 }
 
 // Soft shadow against the character and the world, tracking closest approach.
+//
+// The body is only sampled over the stretch of ray that actually crosses its
+// bounding box. Evaluating nineteen cones at every step of every shadow ray
+// was the single most expensive thing in the frame: most ground pixels cast a
+// ray that never goes near the character, and were paying for it anyway.
 fn shadow(origin: vec3<f32>, dir: vec3<f32>) -> f32 {
+    let span = ray_bounds(origin, 1.0 / dir);
+    let crosses_body = span.y >= span.x;
     var result = 1.0;
     var t = 0.04;
-    for (var i = 0; i < 40; i = i + 1) {
-        let d = min(sd_character(origin + dir * t), sd_world(origin + dir * t));
+    for (var i = 0; i < 28; i = i + 1) {
+        let p = origin + dir * t;
+        var d = sd_boxes(p);
+        if (crosses_body && t >= span.x - 0.05 && t <= span.y + 0.05) {
+            d = min(d, sd_character(p));
+        }
         if (d < 0.0008) {
             return 0.0;
         }
         result = min(result, 9.0 * d / t);
-        t = t + clamp(d * 0.9, 0.02, 0.5);
+        t = t + clamp(d * 0.9, 0.03, 0.6);
         if (t > 9.0) {
             break;
         }
@@ -84,15 +103,22 @@ fn shadow(origin: vec3<f32>, dir: vec3<f32>) -> f32 {
 }
 
 fn ambient_occlusion(p: vec3<f32>, n: vec3<f32>) -> f32 {
+    // Same reasoning as the shadow: skip the body entirely unless this point
+    // is close enough for it to occlude anything.
+    let near_body = bounds_distance(p) < 0.5;
     var occlusion = 0.0;
     var scale = 1.0;
-    for (var i = 1; i <= 5; i = i + 1) {
-        let h = 0.02 * f32(i) * f32(i);
-        let d = min(sd_character(p + n * h), sd_world(p + n * h));
+    for (var i = 1; i <= 4; i = i + 1) {
+        let h = 0.025 * f32(i) * f32(i);
+        let q = p + n * h;
+        var d = sd_world(q);
+        if (near_body) {
+            d = min(d, sd_character(q));
+        }
         occlusion = occlusion + (h - d) * scale;
         scale = scale * 0.68;
     }
-    return clamp(1.0 - 1.4 * occlusion, 0.0, 1.0);
+    return clamp(1.0 - 1.5 * occlusion, 0.0, 1.0);
 }
 
 @fragment
@@ -123,7 +149,7 @@ fn fs_main(@builtin(position) frag: vec4<f32>) -> @location(0) vec4<f32> {
 
     let body = march_character(eye, dir);
     let body_t = select(1.0e9, body.t, body.hit);
-    let solids = march_world(eye, dir, min(min(plane_t, body_t), 60.0));
+    let solids = march_boxes(eye, dir, min(min(plane_t, body_t), 60.0));
     let solid_t = select(1.0e9, solids.t, solids.hit);
 
     let nearest = min(min(body_t, solid_t), plane_t);

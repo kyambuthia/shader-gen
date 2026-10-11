@@ -84,6 +84,7 @@ impl Sim {
 
     fn globals(&self, width: u32, height: u32, time: f32) -> Globals {
         let (lo, hi) = sdf::bounds(&self.cones, self.skeleton.blend_k);
+        let (wlo, whi) = self.world.box_bounds();
         let eye = self.eye;
         let focus = self.focus();
         Globals {
@@ -96,6 +97,8 @@ impl Sim {
             look_at: [focus.x, focus.y, focus.z, 0.0],
             bounds_lo: [lo.x, lo.y, lo.z, 0.0],
             bounds_hi: [hi.x, hi.y, hi.z, 0.0],
+            world_lo: [wlo.x, wlo.y, wlo.z, 0.0],
+            world_hi: [whi.x, whi.y, whi.z, 0.0],
             ..Default::default()
         }
     }
@@ -234,6 +237,79 @@ fn headless(path: &str, seed: u64, settle: u32) {
     );
 }
 
+/// Time the render at a given resolution by submitting frames back to back
+/// and waiting for each, so the number is GPU work rather than queue depth.
+/// Crude - no timestamp queries, which this adapter does not offer - but
+/// enough to tell which pass is worth optimising.
+fn bench(seed: u64, width: u32, height: u32, frames: u32) {
+    let instance = wgpu::Instance::default();
+    let (adapter, device, queue) = pollster::block_on(adapter_and_device(&instance, None));
+
+    let mut sim = Sim::new(seed);
+    for _ in 0..300 {
+        sim.step(Input { forward: 1.0, ..Default::default() }, 1.0 / 120.0);
+    }
+
+    let format = wgpu::TextureFormat::Rgba8Unorm;
+    let target = device.create_texture(&wgpu::TextureDescriptor {
+        label: Some("bench target"),
+        size: wgpu::Extent3d { width, height, depth_or_array_layers: 1 },
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D2,
+        format,
+        usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+        view_formats: &[],
+    });
+    let view = target.create_view(&Default::default());
+
+    let scene = Scene::new(&device, &queue, &sim.world);
+    scene.upload_cones(&queue, &sim.cones);
+    queue.write_buffer(&scene.globals, 0, bytemuck::bytes_of(&sim.globals(width, height, 0.0)));
+    let renderer = Renderer::new(&device, &scene, format);
+
+    let run = |label: &str, count: u32| {
+        // One warm-up frame so shader compilation is not in the sample.
+        for i in 0..count + 1 {
+            if i == 1 {
+                device
+                    .poll(wgpu::PollType::Wait { submission_index: None, timeout: None })
+                    .ok();
+            }
+            let mut encoder =
+                device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
+            renderer.draw(&mut encoder, &view);
+            queue.submit([encoder.finish()]);
+            if i == 0 {
+                device
+                    .poll(wgpu::PollType::Wait { submission_index: None, timeout: None })
+                    .ok();
+            }
+        }
+        let start = std::time::Instant::now();
+        for _ in 0..count {
+            let mut encoder =
+                device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
+            renderer.draw(&mut encoder, &view);
+            queue.submit([encoder.finish()]);
+        }
+        device
+            .poll(wgpu::PollType::Wait { submission_index: None, timeout: None })
+            .ok();
+        let ms = start.elapsed().as_secs_f64() * 1000.0 / count as f64;
+        println!("  {label:<22} {ms:7.2} ms/frame   {:6.1} fps", 1000.0 / ms);
+    };
+
+    println!(
+        "{} on {}\n{width}x{height}, {} cones, {} boxes",
+        adapter.get_info().name,
+        adapter.get_info().backend,
+        sim.cones.len(),
+        sim.world.count()
+    );
+    run("full scene", frames);
+}
+
 /// Minimal PNG writer: one stored deflate block, so debug output costs no
 /// image or compression dependency.
 fn write_png(path: &str, width: u32, height: u32, rgba: &[u8]) {
@@ -294,11 +370,13 @@ struct App {
     queue: Option<wgpu::Queue>,
     scene: Option<Scene>,
     renderer: Option<Renderer>,
+    upscale: Option<shader_gen::gpu::Upscale>,
     config: Option<wgpu::SurfaceConfiguration>,
     sim: Sim,
     keys: Keys,
     last: std::time::Instant,
     start: std::time::Instant,
+    render_scale: u32,
 }
 
 impl ApplicationHandler for App {
@@ -343,10 +421,15 @@ impl ApplicationHandler for App {
         surface.configure(&device, &config);
 
         let scene = Scene::new(&device, &queue, &self.sim.world);
-        let renderer = Renderer::new(&device, &scene, format);
+        // The scene renders into an Rgba8Unorm offscreen target which the
+        // upscale pass stretches to the swapchain, so the pipeline format is
+        // that, not the surface format.
+        let renderer = Renderer::new(&device, &scene, wgpu::TextureFormat::Rgba8Unorm);
+        let upscale = shader_gen::gpu::Upscale::new(&device, format, self.render_scale);
 
         self.scene = Some(scene);
         self.renderer = Some(renderer);
+        self.upscale = Some(upscale);
         self.device = Some(device);
         self.queue = Some(queue);
         self.surface = Some(surface);
@@ -403,17 +486,9 @@ impl ApplicationHandler for App {
             _ => return,
         }
 
-        let (Some(window), Some(surface), Some(device), Some(queue), Some(scene), Some(renderer), Some(config)) = (
-            self.window.as_ref(),
-            self.surface.as_ref(),
-            self.device.as_ref(),
-            self.queue.as_ref(),
-            self.scene.as_ref(),
-            self.renderer.as_ref(),
-            self.config.as_ref(),
-        ) else {
+        if self.window.is_none() {
             return;
-        };
+        }
 
         // Fixed step, so collision behaves the same at any frame rate.
         let now = std::time::Instant::now();
@@ -422,21 +497,32 @@ impl ApplicationHandler for App {
         const STEP: f32 = 1.0 / 120.0;
         let mut remaining = elapsed;
         let input = self.keys.input();
-        self.sim.camera_pitch =
-            (self.sim.camera_pitch + (f32::from(self.keys.pitch_up) - f32::from(self.keys.pitch_down)) * elapsed)
-                .clamp(-0.1, 1.4);
+        self.sim.camera_pitch = (self.sim.camera_pitch
+            + (f32::from(self.keys.pitch_up) - f32::from(self.keys.pitch_down)) * elapsed)
+            .clamp(-0.1, 1.4);
         while remaining > 0.0 {
             self.sim.step(input, STEP.min(remaining));
             remaining -= STEP;
         }
 
+        let (device, queue, config) = (
+            self.device.as_ref().unwrap(),
+            self.queue.as_ref().unwrap(),
+            self.config.as_ref().unwrap(),
+        );
+        let scene = self.scene.as_ref().unwrap();
+        let upscale = self.upscale.as_mut().unwrap();
+
+        // The scene is drawn at reduced resolution, so the uniform carries
+        // the render size rather than the window size.
+        let (render_w, render_h) = upscale.render_size(config.width, config.height);
         scene.upload_cones(queue, &self.sim.cones);
         queue.write_buffer(
             &scene.globals,
             0,
             bytemuck::bytes_of(&self.sim.globals(
-                config.width,
-                config.height,
+                render_w,
+                render_h,
                 self.start.elapsed().as_secs_f32(),
             )),
         );
@@ -444,20 +530,24 @@ impl ApplicationHandler for App {
         use wgpu::CurrentSurfaceTexture as Current;
         // Suboptimal still presents; the other states have no texture to draw
         // into, so skip the frame and let the next one retry.
-        let frame = match surface.get_current_texture() {
+        let frame = match self.surface.as_ref().unwrap().get_current_texture() {
             Current::Success(frame) | Current::Suboptimal(frame) => frame,
             _ => {
-                window.request_redraw();
+                self.window.as_ref().unwrap().request_redraw();
                 return;
             }
         };
-        let view = frame.texture.create_view(&Default::default());
+        let swapchain = frame.texture.create_view(&Default::default());
         let mut encoder =
             device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
-        renderer.draw(&mut encoder, &view);
+        {
+            let offscreen = upscale.target(device, config.width, config.height);
+            self.renderer.as_ref().unwrap().draw(&mut encoder, offscreen);
+        }
+        upscale.present(&mut encoder, &swapchain);
         queue.submit([encoder.finish()]);
         drop(frame); // wgpu 30 presents on drop; there is no present()
-        window.request_redraw();
+        self.window.as_ref().unwrap().request_redraw();
     }
 }
 
@@ -476,6 +566,15 @@ fn main() {
         headless(path, seed, value("--settle").unwrap_or(240) as u32);
         return;
     }
+    if args.iter().any(|a| a == "--bench") {
+        bench(
+            seed,
+            value("--width").unwrap_or(1024) as u32,
+            value("--height").unwrap_or(640) as u32,
+            value("--frames").unwrap_or(60) as u32,
+        );
+        return;
+    }
 
     let event_loop = EventLoop::new().expect("create event loop");
     event_loop.set_control_flow(ControlFlow::Poll);
@@ -487,11 +586,13 @@ fn main() {
             queue: None,
             scene: None,
             renderer: None,
+            upscale: None,
             config: None,
             sim: Sim::new(seed),
             keys: Keys::default(),
             last: std::time::Instant::now(),
             start: std::time::Instant::now(),
+            render_scale: value("--scale").unwrap_or(2) as u32,
         })
         .expect("run");
 }

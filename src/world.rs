@@ -85,3 +85,23 @@ impl World {
         .normalize_or_zero()
     }
 }
+
+impl World {
+    /// Collective bounds of the boxes, used to clip the renderer's march.
+    /// The ground plane is excluded: it is infinite, and the renderer
+    /// intersects it analytically rather than marching it.
+    pub fn box_bounds(&self) -> (Vec3, Vec3) {
+        let mut lo = Vec3::splat(f32::MAX);
+        let mut hi = Vec3::splat(f32::MIN);
+        for b in self.boxes.iter().take(self.count() as usize) {
+            let center = Vec3::new(b.center[0], b.center[1], b.center[2]);
+            let half = Vec3::new(b.half[0], b.half[1], b.half[2]) + Vec3::splat(b.half[3]);
+            lo = lo.min(center - half);
+            hi = hi.max(center + half);
+        }
+        if lo.x > hi.x {
+            return (Vec3::ZERO, Vec3::ZERO);
+        }
+        (lo, hi)
+    }
+}

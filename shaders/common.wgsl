@@ -18,6 +18,8 @@ struct Globals {
     look_at: vec4<f32>,
     bounds_lo: vec4<f32>,
     bounds_hi: vec4<f32>,
+    world_lo: vec4<f32>,
+    world_hi: vec4<f32>,
 }
 
 // xyz is the endpoint, w is that end's radius.
@@ -89,8 +91,11 @@ fn sd_round_box(p: vec3<f32>, center: vec3<f32>, half: vec3<f32>, radius: f32) -
     return length(max(q, vec3<f32>(0.0))) + min(max(q.x, max(q.y, q.z)), 0.0) - radius;
 }
 
-fn sd_world(p: vec3<f32>) -> f32 {
-    var d = p.y;   // ground plane
+// The boxes alone. The ground plane is handled analytically by the renderer
+// and cannot shadow anything above itself, so keeping it out of the marched
+// field saves a step budget on every sky and distant-ground ray.
+fn sd_boxes(p: vec3<f32>) -> f32 {
+    var d = 1.0e9;
     for (var i = 0u; i < globals.box_count; i = i + 1u) {
         let b = boxes[i];
         d = min(d, sd_round_box(p, b.center.xyz, b.half.xyz, b.half.w));
@@ -98,13 +103,36 @@ fn sd_world(p: vec3<f32>) -> f32 {
     return d;
 }
 
-// Slab test against the character's bounds. Returns the entry and exit
-// distances along the ray, or exit < entry when the ray misses.
-fn ray_bounds(origin: vec3<f32>, inv_dir: vec3<f32>) -> vec2<f32> {
-    let t0 = (globals.bounds_lo.xyz - origin) * inv_dir;
-    let t1 = (globals.bounds_hi.xyz - origin) * inv_dir;
+// The full field, boxes and ground. This is what collision queries, and what
+// src/world.rs must stay identical to.
+fn sd_world(p: vec3<f32>) -> f32 {
+    return min(p.y, sd_boxes(p));
+}
+
+// Slab test against an axis-aligned box. Returns the entry and exit distances
+// along the ray, or exit < entry when the ray misses.
+fn ray_slab(origin: vec3<f32>, inv_dir: vec3<f32>, lo_corner: vec3<f32>,
+            hi_corner: vec3<f32>) -> vec2<f32> {
+    let t0 = (lo_corner - origin) * inv_dir;
+    let t1 = (hi_corner - origin) * inv_dir;
     let lo = min(t0, t1);
     let hi = max(t0, t1);
     return vec2<f32>(max(max(lo.x, lo.y), max(lo.z, 0.0)),
                      min(hi.x, min(hi.y, hi.z)));
+}
+
+fn ray_bounds(origin: vec3<f32>, inv_dir: vec3<f32>) -> vec2<f32> {
+    return ray_slab(origin, inv_dir, globals.bounds_lo.xyz, globals.bounds_hi.xyz);
+}
+
+fn ray_world_bounds(origin: vec3<f32>, inv_dir: vec3<f32>) -> vec2<f32> {
+    return ray_slab(origin, inv_dir, globals.world_lo.xyz, globals.world_hi.xyz);
+}
+
+// Distance from a point to the character's bounding box. Nineteen cones is
+// by far the most expensive thing in the scene, so shadow and occlusion rays
+// use this to decide whether the body is even worth evaluating.
+fn bounds_distance(p: vec3<f32>) -> f32 {
+    let q = max(globals.bounds_lo.xyz - p, p - globals.bounds_hi.xyz);
+    return length(max(q, vec3<f32>(0.0))) + min(max(q.x, max(q.y, q.z)), 0.0);
 }
